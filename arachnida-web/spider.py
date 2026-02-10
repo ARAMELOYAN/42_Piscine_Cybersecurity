@@ -7,31 +7,43 @@ import re
 import sys
 import time
 import hashlib
-import subprocess
 from urllib.parse import urljoin, urlparse, urldefrag
 
-import requests
 from bs4 import BeautifulSoup
+
+# Optional backends
+try:
+    import pycurl  # apt: python3-pycurl
+    import io
+    HAS_PYCURL = True
+except Exception:
+    HAS_PYCURL = False
+
+try:
+    import requests
+    HAS_REQUESTS = True
+except Exception:
+    HAS_REQUESTS = False
 
 
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp"}
 DEFAULT_DEPTH = 5
 DEFAULT_OUTDIR = "./data"
+DEFAULT_DELAY = 0.6
 DEFAULT_TIMEOUT = 25
-DEFAULT_DELAY = 0.6  # polite delay
 
 UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 ArachnidaSpider/1.0"
 )
 
-BASE_HEADERS = {
-    "User-Agent": UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,hy;q=0.8,ru;q=0.7",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-}
+BASE_HEADERS = [
+    f"User-Agent: {UA}",
+    "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language: en-US,en;q=0.9,hy;q=0.8,ru;q=0.7",
+    "Connection: keep-alive",
+    "Upgrade-Insecure-Requests: 1",
+]
 
 
 def eprint(*args, **kwargs):
@@ -89,9 +101,8 @@ def guess_ext(url: str, content_type: str | None) -> str | None:
 
 def extract_from_srcset(base_url: str, srcset: str) -> set[str]:
     urls = set()
-    parts = [p.strip() for p in srcset.split(",") if p.strip()]
-    for p in parts:
-        token = p.split()[0].strip()
+    for part in [p.strip() for p in srcset.split(",") if p.strip()]:
+        token = part.split()[0].strip()
         u = normalize_url(base_url, token)
         if u:
             urls.add(u)
@@ -104,8 +115,8 @@ def extract_image_urls(base_url: str, html: str) -> set[str]:
 
     for img in soup.find_all("img"):
         for attr in ("src", "data-src", "data-original", "data-lazy-src", "data-zoom-image"):
-            val = img.get(attr)
-            u = normalize_url(base_url, val) if val else None
+            v = img.get(attr)
+            u = normalize_url(base_url, v) if v else None
             if u:
                 found.add(u)
 
@@ -119,20 +130,21 @@ def extract_image_urls(base_url: str, html: str) -> set[str]:
         if u:
             found.add(u)
 
-    # script/JSON blobs
-    regex = re.compile(
+    # regex: URLs inside scripts/JSON blobs
+    rx = re.compile(
         r"https?://[^\s\"'<>\\]+?\.(?:png|jpe?g|gif|bmp)(?:\?[^\s\"'<>\\]*)?",
         re.IGNORECASE,
     )
-    for m in regex.findall(html):
+    for m in rx.findall(html):
         found.add(m)
 
-    filtered = set()
+    # filter by extension in path
+    out = set()
     for u in found:
         path = urlparse(u).path.lower()
         if any(path.endswith(ext) for ext in ALLOWED_EXTS):
-            filtered.add(u)
-    return filtered
+            out.add(u)
+    return out
 
 
 def extract_page_links(base_url: str, html: str) -> set[str]:
@@ -159,64 +171,88 @@ def extract_page_links(base_url: str, html: str) -> set[str]:
     return links
 
 
-# -------- Fetch backends --------
+# ------------------- Fetch backends -------------------
 
-def fetch_with_requests(session: requests.Session, url: str, timeout: int, referer: str | None = None):
-    headers = dict(BASE_HEADERS)
-    if referer:
-        headers["Referer"] = referer
+def fetch_pycurl(url: str, timeout: int, referer: str | None = None):
+    """
+    Returns: (status_code:int, headers:dict[str,str], body:bytes)
+    """
+    buf = io.BytesIO()
+    hdr = io.BytesIO()
+
+    c = pycurl.Curl()
+    c.setopt(pycurl.URL, url)
+    c.setopt(pycurl.FOLLOWLOCATION, 1)
+    c.setopt(pycurl.TIMEOUT, timeout)
+    c.setopt(pycurl.CONNECTTIMEOUT, min(10, timeout))
+    c.setopt(pycurl.WRITEDATA, buf)
+    c.setopt(pycurl.HEADERFUNCTION, hdr.write)
+    c.setopt(pycurl.HTTPHEADER, BASE_HEADERS + ([f"Referer: {referer}"] if referer else []))
+
+    # Good defaults (similar to curl CLI behavior)
+    c.setopt(pycurl.SSL_VERIFYPEER, 1)
+    c.setopt(pycurl.SSL_VERIFYHOST, 2)
+    c.setopt(pycurl.ACCEPT_ENCODING, "")  # enable gzip/br automatically if supported
+
     try:
-        r = session.get(url, headers=headers, timeout=timeout)
-        return r.status_code, r.headers, r.content
+        c.perform()
+        code = c.getinfo(pycurl.RESPONSE_CODE)
+    except pycurl.error as ex:
+        eprint(f"[fetch:pycurl] failed: {url} ({ex})")
+        c.close()
+        return None, {}, b""
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+    raw_headers = hdr.getvalue().decode("iso-8859-1", errors="ignore")
+    headers = {}
+    for line in raw_headers.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip()] = v.strip()
+
+    return code, headers, buf.getvalue()
+
+
+def fetch_requests(url: str, timeout: int, referer: str | None = None):
+    if not HAS_REQUESTS:
+        return None, {}, b""
+    h = {
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,hy;q=0.8,ru;q=0.7",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    if referer:
+        h["Referer"] = referer
+    try:
+        r = requests.get(url, headers=h, timeout=timeout, allow_redirects=True)
+        return r.status_code, dict(r.headers), r.content
     except requests.RequestException as ex:
-        eprint(f"[fetch:req] failed: {url} ({ex})")
+        eprint(f"[fetch:requests] failed: {url} ({ex})")
         return None, {}, b""
 
 
-def fetch_with_curl(url: str, timeout: int, referer: str | None = None):
-    # curl -L follows redirects; -s silent; --max-time seconds; -A user agent
-    cmd = ["curl", "-L", "-sS", "--max-time", str(timeout), "-A", UA]
-    cmd += ["-H", f"Accept: {BASE_HEADERS['Accept']}"]
-    cmd += ["-H", f"Accept-Language: {BASE_HEADERS['Accept-Language']}"]
-    cmd += ["-H", "Upgrade-Insecure-Requests: 1"]
-    if referer:
-        cmd += ["-e", referer]
-    cmd += [url]
-
-    try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        if p.returncode != 0:
-            eprint(f"[fetch:curl] failed rc={p.returncode}: {url}")
-            if p.stderr:
-                eprint(p.stderr.decode("utf-8", errors="ignore").strip())
-            return None, {}, b""
-        # curl doesn't give us headers here; for extension we can fallback to URL path
-        return 200, {}, p.stdout
-    except FileNotFoundError:
-        eprint("[fetch:curl] curl not found. Install: sudo apt install curl")
-        return None, {}, b""
+def fetch(url: str, timeout: int, referer: str | None = None):
+    # Prefer pycurl for rawpixel-like sites
+    if HAS_PYCURL:
+        return fetch_pycurl(url, timeout, referer=referer)
+    return fetch_requests(url, timeout, referer=referer)
 
 
-def fetch(url: str, session: requests.Session, timeout: int, referer: str | None = None):
-    status, headers, body = fetch_with_requests(session, url, timeout, referer=referer)
-    if status in (403, 429) or status is None:
-        # rawpixel often blocks requests TLS fingerprint; curl usually passes
-        status2, headers2, body2 = fetch_with_curl(url, timeout, referer=referer)
-        if status2 == 200 and body2:
-            return 200, headers2, body2
-        return status, headers, body
-    return status, headers, body
-
-
-def download_image(session: requests.Session, img_url: str, outdir: str, seen_hashes: set[str], timeout: int, referer: str):
-    status, headers, data = fetch(img_url, session, timeout, referer=referer)
-    if status != 200 or not data:
-        eprint(f"[download] status {status}: {img_url}")
+def download_image(img_url: str, outdir: str, seen_hashes: set[str], timeout: int, referer: str) -> bool:
+    code, headers, data = fetch(img_url, timeout, referer=referer)
+    if code != 200 or not data:
+        eprint(f"[download] status {code}: {img_url}")
         return False
 
     ext = guess_ext(img_url, headers.get("Content-Type"))
     if not ext:
-        # fallback by URL path
+        # fallback: by URL path
         path = urlparse(img_url).path.lower()
         if not any(path.endswith(x) for x in ALLOWED_EXTS):
             return False
@@ -249,13 +285,10 @@ def download_image(session: requests.Session, img_url: str, outdir: str, seen_ha
 def crawl(start_url: str, recursive: bool, max_depth: int, outdir: str, timeout: int, delay: float) -> int:
     ensure_dir(outdir)
 
-    session = requests.Session()
-
     visited_pages: set[str] = set()
     seen_img_urls: set[str] = set()
     seen_hashes: set[str] = set()
     queue: list[tuple[str, int]] = [(start_url, 0)]
-
     downloaded = 0
 
     while queue:
@@ -267,17 +300,12 @@ def crawl(start_url: str, recursive: bool, max_depth: int, outdir: str, timeout:
         if recursive and depth > max_depth:
             continue
 
-        status, _headers, body = fetch(page_url, session, timeout, referer="https://www.rawpixel.com/")
-        if status != 200 or not body:
-            eprint(f"[fetch] status {status}: {page_url}")
+        code, _headers, body = fetch(page_url, timeout, referer="https://www.rawpixel.com/")
+        if code != 200 or not body:
+            eprint(f"[fetch] status {code}: {page_url}")
             continue
 
-        # decode html
-        try:
-            html = body.decode("utf-8", errors="ignore")
-        except Exception:
-            html = str(body)
-
+        html = body.decode("utf-8", errors="ignore")
         time.sleep(delay)
 
         imgs = extract_image_urls(page_url, html)
@@ -285,7 +313,7 @@ def crawl(start_url: str, recursive: bool, max_depth: int, outdir: str, timeout:
             if img_url in seen_img_urls:
                 continue
             seen_img_urls.add(img_url)
-            if download_image(session, img_url, outdir, seen_hashes, timeout, referer=page_url):
+            if download_image(img_url, outdir, seen_hashes, timeout, referer=page_url):
                 downloaded += 1
             time.sleep(delay)
 
@@ -295,6 +323,7 @@ def crawl(start_url: str, recursive: bool, max_depth: int, outdir: str, timeout:
                 scheme = urlparse(link).scheme.lower()
                 if scheme not in ("http", "https"):
                     continue
+                # Safe: stay on same host
                 if not same_host(start_url, link):
                     continue
                 if link not in visited_pages:
@@ -316,6 +345,9 @@ def main():
         eprint("URL must start with http:// or https://")
         sys.exit(1)
 
+    if not HAS_PYCURL:
+        eprint("[warn] pycurl not found. For rawpixel-like sites install: sudo apt install python3-pycurl")
+
     downloaded = crawl(
         start_url=url,
         recursive=args.r,
@@ -324,6 +356,7 @@ def main():
         timeout=DEFAULT_TIMEOUT,
         delay=DEFAULT_DELAY,
     )
+
     print(f"\nDone. Downloaded: {downloaded} image(s) into {os.path.abspath(args.p)}")
 
 
