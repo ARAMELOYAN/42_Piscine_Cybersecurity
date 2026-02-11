@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import CurlFetcher
 import argparse
 import os
 import re
@@ -8,6 +9,7 @@ import sys
 import time
 import hashlib
 from urllib.parse import urljoin, urlparse, urldefrag
+from collections import deque
 
 from bs4 import BeautifulSoup
 
@@ -78,8 +80,8 @@ def safe_filename(name: str) -> str:
 
 
 def content_hash(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()[:16]
-
+    # Faster than sha256 and more than enough for dedup
+    return hashlib.blake2b(data, digest_size=8).hexdigest()
 
 def guess_ext(url: str, content_type: str | None) -> str | None:
     ct = (content_type or "").lower()
@@ -271,6 +273,9 @@ def download_image(img_url: str, outdir: str, seen_hashes: set[str], timeout: in
     filename = f"{os.path.splitext(base)[0]}_{h}{ext}"
     path = os.path.join(outdir, filename)
 
+    if os.path.exists(path):
+        return False
+
     try:
         with open(path, "wb") as f:
             f.write(data)
@@ -288,17 +293,17 @@ def crawl(start_url: str, recursive: bool, max_depth: int, outdir: str, timeout:
     visited_pages: set[str] = set()
     seen_img_urls: set[str] = set()
     seen_hashes: set[str] = set()
-    queue: list[tuple[str, int]] = [(start_url, 0)]
+    queue = deque([(start_url, 0)])
     downloaded = 0
 
     while queue:
-        page_url, depth = queue.pop(0)
+        page_url, depth = queue.popleft()
+        if recursive and depth > max_depth:
+            continue
+
         if page_url in visited_pages:
             continue
         visited_pages.add(page_url)
-
-        if recursive and depth > max_depth:
-            continue
 
         code, _headers, body = fetch(page_url, timeout, referer="https://www.rawpixel.com/")
         if code != 200 or not body:
@@ -308,7 +313,20 @@ def crawl(start_url: str, recursive: bool, max_depth: int, outdir: str, timeout:
         html = body.decode("utf-8", errors="ignore")
         time.sleep(delay)
 
-        imgs = extract_image_urls(page_url, html)
+        imgs = set()
+
+        # Only parse DOM if it actually contains img tags
+        if "<img" in html:
+            imgs |= extract_image_urls(page_url, html)
+        else:
+            # fallback: regex-only extraction
+            import re
+            rx = re.compile(
+                r"https?://[^\s\"'<>\\]+?\.(?:png|jpe?g|gif|bmp)(?:\?[^\s\"'<>\\]*)?",
+                re.IGNORECASE,
+            )
+            for m in rx.findall(html):
+                imgs.add(m)
         for img_url in imgs:
             if img_url in seen_img_urls:
                 continue
